@@ -3,9 +3,6 @@ on: push
 jobs:
   release:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        use_efi: ['true', 'false']
     steps:
       - uses: actions/checkout@v2
       # PREPARE BUILDX
