@@ -12,7 +12,6 @@ export const useAppStore = defineStore('app', {
         ...params,
         connectionId: connectionId,
         status: ConnectStatus.connected,
-        tunnels: [],
       });
     },
     addTunnel(params: AddTunnelParams) {

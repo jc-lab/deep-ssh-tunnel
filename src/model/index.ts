@@ -14,10 +14,12 @@ export enum ConnectStatus {
 }
 
 export interface NewConnectParams {
+  connectionId?: string;
   via: string;
   target: string; // hostname:port or alias:XXXX
   username: string;
   password: string;
+  force?: boolean;
 }
 
 export interface ConnectResult {
@@ -45,7 +47,6 @@ export interface AddTunnelResult {
 export interface SshConnect extends NewConnectParams {
   connectionId: string;
   status: ConnectStatus;
-  tunnels: Tunnel[];
 }
 
 export interface UpdateSshPayload {

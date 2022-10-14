@@ -54,11 +54,33 @@ import ConnectItem from '@/component/ConnectItem.vue';
 import {useAppStore} from '@/store/app';
 import {AddTunnelParams, AddTunnelResult, ConnectResult, NewConnectParams, SshConnect, Tunnel} from "@/model";
 
+interface ExportedTunnel {
+  type: string;
+  name: string;
+  localPort: number;
+  target?: string;
+  dnsServer?: string;
+}
+
+interface ExportedConnection {
+  connectionId: string;
+  via: string;
+  target: string;
+  username: string;
+  password: string;
+  tunnels: ExportedTunnel[];
+}
+
+interface ExportedConfig {
+  connections: ExportedConnection[];
+}
+
 declare global {
   interface Window {
     appHandler: (type: string, data: any) => void;
     electronAPI: {
       connectSsh(params: NewConnectParams): Promise<ConnectResult>;
+      disconnectSsh(connectionId: string): Promise<void>;
       addTunnel(params: AddTunnelParams): Promise<AddTunnelResult>;
       appListenStart(params: any): Promise<void>;
       appListenStop(): void;
@@ -109,35 +131,100 @@ export default defineComponent({
       }
     },
     importConfig(input: string) {
+      const loadedConfig = JSON.parse(input) as ExportedConfig;
+
+      loadedConfig.connections.forEach((c) => {
+        const existingConnection = this.connections.find((v) => c.connectionId === v.connectionId);
+        if (existingConnection) {
+          // ok
+        } else {
+          this.pushConnection({
+            connectionId: c.connectionId,
+            via: c.via,
+            target: c.target,
+            username: c.username,
+            password: c.password,
+            force: true,
+          })
+            .then(() => {
+              c.tunnels.forEach((t) => {
+                const tunnelParams: AddTunnelParams = {
+                  via: c.connectionId,
+                  type: t.type as any,
+                  name: t.name,
+                  target: t.target,
+                  dnsServer: t.dnsServer,
+                  localPort: t.localPort
+                };
+                window.electronAPI.addTunnel(tunnelParams)
+                    .then((tunnelResp) => {
+                      console.log('tunnelResp', tunnelResp);
+                      if (tunnelResp.result) {
+                        this.appStore.addTunnel({
+                          ...tunnelParams,
+                          localPort: tunnelResp.localPort,
+                        });
+                      } else {
+                        alert(tunnelResp.message);
+                      }
+                    });
+              });
+            });
+        }
+      });
+
+
       // ok
     },
     exportConfig(): string {
       // ok
-      return '';
+      return JSON.stringify({
+        connections: this.connections.map((v) => ({
+          connectionId: v.connectionId,
+          via: v.via,
+          target: v.target,
+          username: v.username,
+          password: v.password,
+          tunnels: this.tunnels.filter((t) => t.via === v.connectionId).map((t) => ({
+            type: t.type,
+            name: t.name,
+            localPort: t.localPort,
+            target: t.target,
+            dnsServer: t.dnsServer,
+          }))
+        })),
+      } as ExportedConfig, null, 2);
     },
     addNewConnection() {
       this.newConnectionConnecting = true;
-      window.electronAPI.connectSsh({
-        via: this.newConnection.via,
-        target: this.newConnection.target,
-        username: this.newConnection.username,
-        password: this.newConnection.password,
-      })
-        .then((result) => {
-          console.log(result);
-          if (result.result) {
-            this.appStore.addConnection(result.connectionId, this.newConnection);
+      return this.pushConnection(this.newConnection)
+          .then(() => {
             this.newConnection = emptyNewConnection();
-          } else {
-            alert(result.message);
-          }
-        })
-        .finally(() => {
-          this.newConnectionConnecting = false;
-        });
+          })
+          .finally(() => {
+            this.newConnectionConnecting = false;
+          });
     },
     removeConnection(item: SshConnect) {
+      window.electronAPI.disconnectSsh(item.connectionId);
       this.appStore.removeConnection(item.target);
+    },
+    pushConnection(params: NewConnectParams) {
+      return window.electronAPI.connectSsh(params)
+          .then((result) => {
+            console.log(result);
+
+            this.appStore.addConnection(result.connectionId, params);
+
+            if (!result.result) {
+              alert(result.message);
+            }
+
+            return result;
+          })
+          .finally(() => {
+            this.newConnectionConnecting = false;
+          });
     }
   }
 });

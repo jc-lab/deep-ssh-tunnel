@@ -4,6 +4,7 @@ import {app, BrowserWindow, ipcMain, protocol} from 'electron'
 import {createProtocol} from 'vue-cli-plugin-electron-builder/lib'
 import installExtension, {VUEJS3_DEVTOOLS} from 'electron-devtools-installer'
 import {URL} from 'url';
+import * as events from 'events';
 import * as path from 'path';
 import * as ssh2 from 'ssh2';
 import * as net from 'net';
@@ -31,10 +32,16 @@ protocol.registerSchemesAsPrivileged([
 type SshConnectId = string;
 type TunnelName = string;
 
-interface SshContext {
-  connectConfig: ssh2.ConnectConfig;
-  sshClient: ssh2.Client;
-  connectedTunnels: Tunnel[];
+class SshContext extends events.EventEmitter {
+  public readonly connectConfig: ssh2.ConnectConfig;
+
+  public sshClient!: ssh2.Client;
+  public tunnels: TunnelContext[] = [];
+
+  constructor(connectConfig: ssh2.ConnectConfig) {
+    super();
+    this.connectConfig = connectConfig;
+  }
 }
 
 interface TunnelContext {
@@ -93,7 +100,7 @@ class AppContext {
   }
 
   connectSsh(params: NewConnectParams): Promise<ConnectResult> {
-    const connectionId = uuid.v4();
+    const connectionId = params.connectionId || uuid.v4();
 
     const viaServer = params.via ? this._sshContexts[params.via] : null;
     if (params.via && !viaServer) {
@@ -104,18 +111,23 @@ class AppContext {
       });
     }
 
+    const connectConfig: ssh2.ConnectConfig = {
+      port: 22,
+      username: params.username,
+      password: params.password,
+      readyTimeout: 1000,
+    };
+
+    const parsed = new URL(`ssh://${params.target}`);
+    connectConfig.host = parsed.hostname;
+    if (parsed.port) connectConfig.port = parseInt(parsed.port);
+
+    const context = new SshContext(connectConfig);
+    if (params.force) {
+      this._sshContexts[connectionId] = context;
+    }
+
     return new Promise<ConnectResult>((resolve, reject) => {
-      const connectConfig: ssh2.ConnectConfig = {
-        port: 22,
-        username: params.username,
-        password: params.password,
-        readyTimeout: 1000,
-      };
-
-      const parsed = new URL(`ssh://${params.target}`);
-      connectConfig.host = parsed.hostname;
-      if (parsed.port) connectConfig.port = parseInt(parsed.port);
-
       let firstConnecting = true;
       const reconnect = () => {
         if (!firstConnecting) {
@@ -128,13 +140,12 @@ class AppContext {
         const connection = new ssh2.Client();
         connection
           .on('ready', () => {
+            context.sshClient = connection;
+
             if (firstConnecting) {
-              const context: SshContext = {
-                connectConfig,
-                connectedTunnels: [],
-                sshClient: connection
-              };
-              this._sshContexts[connectionId] = context;
+              if (!params.force) {
+                this._sshContexts[connectionId] = context;
+              }
 
               firstConnecting = false;
               resolve({
@@ -148,15 +159,21 @@ class AppContext {
                 status: ConnectStatus.connected,
               });
             }
+
+            context.emit('ready');
           })
           .on('error', (err) => {
             if (firstConnecting) {
               firstConnecting = false;
-              resolve({
-                result: false,
-                message: err.message,
-                connectionId: '',
-              });
+              if (params.force) {
+                resolve({
+                  result: false,
+                  message: err.message,
+                  connectionId: connectionId,
+                });
+              } else {
+                reject(err);
+              }
             } else {
               this.emitSshUpdate({
                 target: params.target,
@@ -169,28 +186,53 @@ class AppContext {
           });
 
         if (viaServer) {
-          viaServer.sshClient.forwardOut('127.0.0.1', 0, connectConfig.host as string, connectConfig.port || 22, (err, stream) => {
-            if (err) {
-              resolve({
-                result: false,
-                message: err.message,
-                connectionId: '',
+          const doConnect = () => {
+            viaServer.sshClient.forwardOut('127.0.0.1', 0, connectConfig.host as string, connectConfig.port || 22, (err, stream) => {
+              if (err) {
+                resolve({
+                  result: false,
+                  message: err.message,
+                  connectionId: '',
+                });
+                return ;
+              }
+              connection.connect({
+                ...connectConfig,
+                host: undefined,
+                port: undefined,
+                sock: stream,
               });
-              return ;
-            }
-            connection.connect({
-              ...connectConfig,
-              host: undefined,
-              port: undefined,
-              sock: stream,
             });
-          });
+          };
+          if (viaServer.sshClient) {
+            doConnect();
+          } else {
+            viaServer.once('ready', () => {
+              doConnect();
+            });
+          }
         } else {
           connection.connect(connectConfig);
         }
       };
       reconnect();
     });
+  }
+
+  disconnectSsh(connectionId: string): Promise<void> {
+    const sshContext = this._sshContexts[connectionId];
+    if (sshContext) {
+      console.log('DISCONNECT ', connectionId);
+      delete this._sshContexts[connectionId];
+
+      sshContext.tunnels.forEach((tunnel) => {
+        delete this._tunnels[tunnel.name];
+        tunnel.localServer.close();
+      });
+
+      sshContext.sshClient.end();
+    }
+    return Promise.resolve();
   }
 
   addTunnel(params: AddTunnelParams): Promise<AddTunnelResult> {
@@ -203,6 +245,14 @@ class AppContext {
       });
     }
     return new Promise<AddTunnelResult>((resolve, reject) => {
+      const tunnelContext: TunnelContext = {
+        sshContext,
+        name: params.name,
+        target: params.target!,
+        localPort: -1,
+        localServer: null as any,
+      };
+
       if (params.type === 'tcp') {
         const parsed = new URL(`tcp://${params.target}`);
 
@@ -219,13 +269,6 @@ class AppContext {
           });
         });
 
-        const tunnelContext: TunnelContext = {
-          sshContext,
-          localServer,
-          name: params.name,
-          target: params.target!,
-          localPort: -1,
-        };
         localServer
           .on('error', (err) => {
             resolve({
@@ -235,10 +278,13 @@ class AppContext {
             });
           })
           .listen(params.localPort, '127.0.0.1', () => {
-            console.log('localServer: ', localServer);
             const localPort = (localServer.address() as net.AddressInfo).port;
             tunnelContext.localPort = localPort;
+            tunnelContext.localServer = localServer;
+
             this._tunnels[tunnelContext.name] = tunnelContext;
+            sshContext.tunnels.push(tunnelContext);
+
             resolve({
               result: true,
               localPort,
@@ -302,6 +348,12 @@ class AppContext {
         proxyServer.listen(params.localPort, '127.0.0.1', () => {
           const serverSocket: net.Server = ((proxyServer as any).serverSocket);
           const localPort = (serverSocket.address() as net.AddressInfo).port;
+
+          tunnelContext.localPort = localPort;
+          tunnelContext.localServer = serverSocket;
+          this._tunnels[tunnelContext.name] = tunnelContext;
+          sshContext.tunnels.push(tunnelContext);
+
           resolve({
             result: true,
             localPort,
@@ -342,8 +394,11 @@ async function createWindow() {
     }
   })
 
-  ipcMain.handle('app.connect-ssh', (event, params: any) => {
+  ipcMain.handle('app.ssh.connect', (event, params: any) => {
     return appContext.connectSsh(params);
+  });
+  ipcMain.handle('app.ssh.disconnect', (event, params: any) => {
+    return appContext.disconnectSsh(params);
   });
   ipcMain.handle('app.add-tunnel', (event, params: any) => {
     return appContext.addTunnel(params);

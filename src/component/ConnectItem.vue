@@ -48,7 +48,6 @@
 </template>
 <script lang="ts">
 import { defineComponent } from 'vue';
-import * as uuid from 'uuid';
 import {AddTunnelParams, AddTunnelResult, Tunnel} from "@/model";
 import {useAppStore} from "@/store/app";
 import {pinia} from "@/plugin/pinia";
