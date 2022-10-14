@@ -197,7 +197,12 @@ export default defineComponent({
     },
     addNewConnection() {
       this.newConnectionConnecting = true;
-      return this.pushConnection(this.newConnection)
+      return this.pushConnection({
+        via: this.newConnection.via,
+        target: this.newConnection.target,
+        username: this.newConnection.username,
+        password: this.newConnection.password
+      })
           .then(() => {
             this.newConnection = emptyNewConnection();
           })
